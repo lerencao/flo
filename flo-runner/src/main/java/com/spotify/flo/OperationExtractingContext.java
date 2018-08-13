@@ -21,6 +21,7 @@
 package com.spotify.flo;
 
 import static com.spotify.flo.EvalContext.sync;
+import static com.spotify.flo.EvalContextWithTask.withTask;
 
 import com.spotify.flo.TaskBuilder.F1;
 import java.util.Objects;
@@ -59,10 +60,11 @@ public class OperationExtractingContext<T> implements EvalContext {
   }
 
   public Operation<T> extract() {
+    final EvalContext ec = withTask(this, task);
     final Object[] args = task.args().stream()
-        .map(arg -> arg.get(this))
+        .map(arg -> arg.get(ec))
         .map(value -> value.map(v -> (Object) v))
-        .collect(Values.toValueList(this))
+        .collect(Values.toValueList(ec))
         .get().toArray();
 
     final Object spec = task.processFn().invoke(args);
