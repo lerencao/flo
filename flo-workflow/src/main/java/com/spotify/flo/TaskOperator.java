@@ -40,8 +40,13 @@ public interface TaskOperator<ContextT, SpecT, ResultT>
   default ResultT perform(SpecT spec, Listener listener) {
     final Operation<ResultT, ?> operation = start(spec, listener);
     Optional state = Optional.empty();
-    Operation.Result<ResultT, ?> result = operation.perform(state, listener);
-    while (!result.isDone()) {
+    Operation.Result<ResultT, ?> result;
+    while (true) {
+      result = operation.perform(state, listener);
+      if (result.isDone()) {
+        break;
+      }
+      state = result.state();
       try {
         Thread.sleep(result.pollInterval().toMillis());
       } catch (InterruptedException e) {
