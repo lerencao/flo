@@ -20,17 +20,21 @@
 
 package com.spotify.flo.context;
 
-import static org.hamcrest.Matchers.hasKey;
+import static com.spotify.flo.freezer.PersistingContext.deserialize;
+import static com.spotify.flo.freezer.PersistingContext.serialize;
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.hamcrest.Matchers.is;
 import static org.junit.Assert.assertThat;
 
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.spotify.flo.EvalContext;
 import com.spotify.flo.Fn;
 import com.spotify.flo.OperationExtractingContext;
 import com.spotify.flo.OperationExtractingContext.Operation;
 import com.spotify.flo.Task;
 import com.spotify.flo.TaskBuilder.F1;
+import com.spotify.flo.TaskBuilder.F2;
 import com.spotify.flo.TaskContextStrict;
 import com.spotify.flo.TaskId;
 import com.spotify.flo.TaskOperator;
@@ -38,20 +42,15 @@ import com.spotify.flo.TaskOperator.Listener;
 import com.spotify.flo.TaskOperator.Operation.Result;
 import com.spotify.flo.freezer.EvaluatingContext;
 import com.spotify.flo.freezer.PersistingContext;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.Comparator;
-import java.util.HashMap;
+import java.util.ArrayList;
 import java.util.HashSet;
-import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
-import java.util.Map.Entry;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
@@ -62,6 +61,7 @@ import org.junit.rules.TemporaryFolder;
 import org.rocksdb.Options;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
+import org.rocksdb.RocksIterator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -85,13 +85,16 @@ public class EphemeralExecutionTest {
   private static final boolean DEBUG = false;
 
   private static final String ROOT_TASK_ID = "root_task_id";
-  private static final String TASK_PATHS = "task_paths";
-  private static final String TASKS = "tasks";
-  private static final String OPERATIONS = "operations";
-  private static final String OPERATION_STATES = "operation_states";
+  private static final String TASK_PATH = "task_path";
+  private static final String TASK = "task";
+  private static final String OPERATION = "operation";
+  private static final String OPERATION_STATE = "operation_states";
   private static final String OPERATION_SCHEDULE = "operation_schedule";
 
   private static final Logger log = LoggerFactory.getLogger(EphemeralExecutionTest.class);
+  private static final F2<String, String, TaskOperator.Operation> ASSERTION_ERROR = (type, key) -> {
+    throw new AssertionError("Value for '" + type + "|" + key + "' not found");
+  };
 
   @Rule public TemporaryFolder temporaryFolder = new TemporaryFolder();
 
@@ -113,14 +116,15 @@ public class EphemeralExecutionTest {
       log.info("Executing workflow (iteration={})", i);
       final Optional<Duration> sleep = fork(() -> runWorkflowTick(dbPath, persistedTasksDir));
       if (sleep.isPresent()) {
-        log.info("Idle, waiting {}s", sleep.get().getSeconds());
-        Thread.sleep(sleep.get().toMillis());
+        final long sleepMillis = Long.max(sleep.get().toMillis(), 0);
+        log.info("Idle, waiting {}ms", sleepMillis);
+        Thread.sleep(sleepMillis);
       } else {
         break;
       }
     }
 
-    final TaskId rootTaskId = read(dbPath, ROOT_TASK_ID);
+    final TaskId rootTaskId = withRocksDB(dbPath, db -> read(db, ROOT_TASK_ID));
     final EvaluatingContext evaluatingContext = evaluationContext(persistedTasksDir);
     final String result = evaluatingContext.readExistingOutput(rootTaskId);
 
@@ -218,12 +222,13 @@ public class EphemeralExecutionTest {
       throw new RuntimeException(e);
     }
 
-    final Map<TaskId, String> tasks = new HashMap<>();
-    tasks(root, t -> tasks.put(t.id(), persistingContext.getFiles().get(t.id()).toAbsolutePath().toString()));
+    final Map<TaskId, Path> files = persistingContext.getFiles();
 
     withRocksDB(dbPath, db -> {
-      write(db, TASKS, new HashSet<>(tasks.keySet()));
-      write(db, TASK_PATHS, tasks);
+      for (Task<?> task : tasks(root)) {
+        write(db, TASK_PATH, task.id().toString(), files.get(task.id()).toAbsolutePath().toString());
+        write(db, TASK, task.id().toString(), "");
+      }
       write(db, ROOT_TASK_ID, root.id());
       return null;
     });
@@ -240,21 +245,15 @@ public class EphemeralExecutionTest {
   }
 
   private static Optional<Duration> runWorkflowTick0(RocksDB db, String persistedTasksDir) throws RocksDBException, IOException {
-    final Set<TaskId> tasks = read(db, TASKS, HashSet::new);
-    final Map<TaskId, String> taskPaths = read(db, TASK_PATHS, HashMap::new);
-    final Map<TaskId, TaskOperator.Operation> operations = read(db, OPERATIONS, HashMap::new);
-    final Map<TaskId, Object> operationStates = read(db, OPERATION_STATES, HashMap::new);
-    final Map<TaskId, Instant> operationSchedule = read(db, OPERATION_SCHEDULE, HashMap::new);
 
-    log.info("#tasks={}, #operations={}", tasks.size(), operations.size());
+    boolean progressed = false;
 
     // Evaluate tasks
-    final Iterator<TaskId> taskIt = tasks.iterator();
-    boolean progressed = false;
-    while (taskIt.hasNext()) {
-      final ByteArrayInputStream bais = new ByteArrayInputStream(
-          Files.readAllBytes(Paths.get(taskPaths.get(taskIt.next()))));
-      final Task<?> task = PersistingContext.deserialize(bais);
+    final List<String> tasks = readKeys(db, TASK);
+    log.info("# tasks={}", tasks.size());
+    for (String taskId : tasks) {
+      final String taskPath = read(db, TASK_PATH, taskId);
+      final Task<?> task = deserialize(Paths.get(taskPath));
       final boolean inputReady = task.inputs().stream().map(Task::id)
           .allMatch(evaluationContext(persistedTasksDir)::isEvaluated);
       if (!inputReady) {
@@ -263,8 +262,6 @@ public class EphemeralExecutionTest {
       }
 
       progressed = true;
-
-      final String taskPath = taskPaths.get(task.id()).toString();
 
       // Check if output has already been produced and execution can be skipped
       @SuppressWarnings("unchecked") final Optional<TaskContextStrict<?, Object>> outputContext =
@@ -275,7 +272,7 @@ public class EphemeralExecutionTest {
         if (lookup.isPresent()) {
           log.info("task {}: output already exists, not executing", task.id());
           evaluationContext(persistedTasksDir).persist(task.id(), lookup.get());
-          taskIt.remove();
+          delete(db, TASK, taskId);
           continue;
         }
       }
@@ -288,7 +285,7 @@ public class EphemeralExecutionTest {
             OperationExtractingContext.extract(task, taskOutput(evaluationContext(persistedTasksDir))));
         final TaskOperator.Operation operation = op.operator.start(op.spec, Listener.NOP);
         log.info("task {}: operation {}: starting", task.id(), operation);
-        operations.put(task.id(), operation);
+        write(db, OPERATION, task.id().toString(), operation);
       } else {
         // Execute generic task
         log.info("task {}: executing generic task", task.id());
@@ -301,75 +298,77 @@ public class EphemeralExecutionTest {
         });
         log.info("task {}: generic task completed", task.id());
       }
-      taskIt.remove();
+
+      delete(db, TASK, taskId);
     }
 
     // Run operators
-    final Iterator<Entry<TaskId, TaskOperator.Operation>> opIt = operations.entrySet().iterator();
-    while (opIt.hasNext()) {
-      final Entry<TaskId, TaskOperator.Operation> e = opIt.next();
-      final TaskId taskId = e.getKey();
+    final List<String> operations = readKeys(db, OPERATION);
+    log.info("# operations={}", operations.size());
+    Instant firstPoll = null;
+    for (String taskId : operations) {
+
+      final Instant pollDeadline = read(db, OPERATION_SCHEDULE, taskId, Instant.MIN);
+      if (firstPoll == null || firstPoll.isAfter(pollDeadline)) {
+        firstPoll = pollDeadline;
+      }
 
       // Due for polling?
-      final Instant pollDeadline = operationSchedule.getOrDefault(taskId, Instant.MIN);
       if (Instant.now().isBefore(pollDeadline)) {
         continue;
       }
 
       // Poll!
-      final TaskOperator.Operation operation = e.getValue();
+      final TaskOperator.Operation operation = read(db, OPERATION, taskId, ASSERTION_ERROR);
       log.info("task {}: operation {}: polling", taskId, operation);
-      Optional<Object> state = Optional.ofNullable(operationStates.get(taskId));
+      Optional<Object> state = Optional.ofNullable(read(db, OPERATION_STATE, taskId));
       final Result result = operation.perform(state, Listener.NOP);
 
       // Done?
       if (!result.isDone()) {
         log.info("task {}: operation {}: not done, checking again in {}", taskId, operation, result.pollInterval());
-        operationSchedule.put(taskId, Instant.now().plus(result.pollInterval()));
-        result.state().ifPresent(s -> operationStates.put(taskId, s));
+        write(db, OPERATION_SCHEDULE, taskId, Instant.now().plus(result.pollInterval()));
+        if (result.state().isPresent()) {
+          write(db, OPERATION_STATE, taskId, result.state().get());
+        }
         continue;
       }
 
       // Done!
       log.info("task {}: operation {}: completed", taskId, operation);
       progressed = true;
-      operationStates.remove(taskId);
-      operationSchedule.remove(taskId);
 
       if (result.isSuccess()) {
-        evaluationContext(persistedTasksDir).persist(taskId, result.output());
+        evaluationContext(persistedTasksDir).persist(TaskId.parse(taskId), result.output());
       } else {
         throw new RuntimeException(result.cause());
       }
 
-      opIt.remove();
+      delete(db, OPERATION_STATE, taskId);
+      delete(db, OPERATION_SCHEDULE, taskId);
+      delete(db, OPERATION, taskId);
     }
 
     // Sanity check
-    assertThat(operations.keySet(), is(operationSchedule.keySet()));
-    for (TaskId taskId : operationSchedule.keySet()) {
-      assertThat(operations, hasKey(taskId));
+    {
+      final Set<String> operationKeys = ImmutableSet.copyOf(readKeys(db, OPERATION));
+      assertThat(ImmutableSet.copyOf(readKeys(db, OPERATION_SCHEDULE)), is(operationKeys));
+      for (String taskId : readKeys(db, OPERATION_STATE)) {
+        assertThat(operationKeys.contains(taskId), is(true));
+      }
     }
 
     // Any tasks or operations left?
-    if (tasks.isEmpty() && operations.isEmpty()) {
+    if (count(db, TASK) == 0 && count(db, OPERATION) == 0) {
       log.info("all tasks and operations completed");
       return Optional.empty();
     }
-
-    write(db, TASKS, tasks);
-    write(db, OPERATIONS, operations);
-    write(db, OPERATION_STATES, operationStates);
-    write(db, OPERATION_SCHEDULE, operationSchedule);
 
     if (progressed) {
       return Optional.of(Duration.ofSeconds(0));
     }
 
-    final Instant nextPoll = operationSchedule.values().stream()
-        .min(Comparator.naturalOrder())
-        .orElseThrow(AssertionError::new);
-    return Optional.of(Duration.between(Instant.now(), nextPoll));
+    return Optional.of(Duration.between(Instant.now(), firstPoll));
   }
 
   private static <T> T fork(Fn<T> f) {
@@ -383,32 +382,94 @@ public class EphemeralExecutionTest {
     }
   }
 
-  private static void write(String dbPath, String key, Object value) {
-    withRocksDB(dbPath, db -> write(db, key, value));
+  private static void write(RocksDB db, String key, Object value) throws RocksDBException {
+    write(db, "", key, value);
+    db.put(key.getBytes(UTF_8), serialize(value));
   }
 
-  private static Object write(RocksDB db, String key, Object value) throws RocksDBException {
-    final ByteArrayOutputStream baos = new ByteArrayOutputStream();
-    PersistingContext.serialize(value, baos);
-    db.put(key.getBytes(StandardCharsets.UTF_8), baos.toByteArray());
-    return null;
+  private static void write(RocksDB db, String type, String key, Object value) throws RocksDBException {
+    db.put(key(type, key), serialize(value));
   }
 
-  private static <T> T read(String dbPath, String key) {
-    return withRocksDB(dbPath, db -> read(db, key, () -> null));
+  private static <T> T read(RocksDB db, String key) throws RocksDBException {
+    return read(db, "", key, (t, k) -> null);
   }
 
-  private static <T> T read(String dbPath, String key, Fn<T> d) {
-    return withRocksDB(dbPath, db -> read(db, key, d));
+  private static <T> T read(RocksDB db, String type, String key) throws RocksDBException {
+    return read(db, type, key, (t, k) -> null);
   }
 
-  private static <T> T read(RocksDB db, String key, Fn<T> defaultValue) throws RocksDBException {
-    final byte[] bytes = db.get(key.getBytes(StandardCharsets.UTF_8));
-    if (bytes == null) {
-      return defaultValue.get();
+  private static void delete(RocksDB db, String type, String key) throws RocksDBException {
+    db.delete(key(type, key));
+  }
+
+  private static List<String> readKeys(RocksDB db, String type) {
+    final List<String> keys = new ArrayList<>();
+    try (final RocksIterator iterator = db.newIterator()) {
+      final byte[] prefix = key(type, "");
+      iterator.seek(prefix);
+      while (iterator.isValid()) {
+        final byte[] rawKey = iterator.key();
+        if (!hasPrefix(rawKey, prefix)) {
+          break;
+        }
+        keys.add(new String(rawKey, prefix.length, rawKey.length - prefix.length, UTF_8));
+        iterator.next();
+      }
+      return keys;
     }
-    final ByteArrayInputStream bais = new ByteArrayInputStream(bytes);
-    return PersistingContext.deserialize(bais);
+  }
+
+  private static long count(RocksDB db, String type) {
+    long n = 0;
+    try (final RocksIterator iterator = db.newIterator()) {
+      final byte[] prefix = key(type, "");
+      iterator.seek(prefix);
+      while (iterator.isValid()) {
+        final byte[] rawKey = iterator.key();
+        if (!hasPrefix(rawKey, prefix)) {
+          break;
+        }
+        n++;
+        iterator.next();
+      }
+      return n;
+    }
+  }
+
+  private static boolean hasPrefix(byte[] key, byte[] prefix) {
+    if (key.length < prefix.length) {
+      return false;
+    }
+    for (int i = 0; i < prefix.length; i++) {
+      if (key[i] != prefix[i]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private static <T> T read(RocksDB db, String type, String key, T defaultValue) throws RocksDBException {
+    return read(db, type, key, (t, k) -> defaultValue);
+  }
+
+  private static <T> T read(RocksDB db, String type, String key, F2<String, String, T> defaultValue)
+      throws RocksDBException {
+    final byte[] bytes = db.get(key(type, key));
+    if (bytes == null) {
+      return defaultValue.apply(type, key);
+    }
+    return deserialize(bytes);
+  }
+
+  private static byte[] key(String type, String key) {
+    if (type.indexOf('|') != -1) {
+      throw new IllegalArgumentException();
+    }
+    if (key.indexOf('|') != -1) {
+      throw new IllegalArgumentException();
+    }
+    return (type + '|' + key).getBytes(UTF_8);
   }
 
   private static <T> T withRocksDB(final String dbPath, RocksDBFn<T> f) {
@@ -439,6 +500,12 @@ public class EphemeralExecutionTest {
   private static void tasks(Task<?> task, Consumer<Task<?>> f) {
     f.accept(task);
     task.inputs().forEach(upstream -> tasks(upstream, f));
+  }
+
+  private static Set<Task<?>> tasks(Task<?> task) {
+    final Set<Task<?>> tasks = new HashSet<>();
+    tasks(task, tasks::add);
+    return tasks;
   }
 
   private static class DoneOutput<T> extends TaskContextStrict<String, T> {

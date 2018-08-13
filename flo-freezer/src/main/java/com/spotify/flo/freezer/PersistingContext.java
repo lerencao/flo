@@ -33,9 +33,10 @@ import com.spotify.flo.Fn;
 import com.spotify.flo.Task;
 import com.spotify.flo.TaskId;
 import com.spotify.flo.context.ForwardingEvalContext;
-import com.twitter.chill.IKryoRegistrar;
 import com.twitter.chill.KryoInstantiator;
 import com.twitter.chill.java.PackageRegistrar;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -105,12 +106,22 @@ public class PersistingContext extends ForwardingEvalContext {
     }
   }
 
+  public static byte[] serialize(Object object) {
+    final ByteArrayOutputStream baos = new ByteArrayOutputStream();
+    serialize(object, baos);
+    return baos.toByteArray();
+  }
+
   public static void serialize(Object object, OutputStream outputStream) {
     final Kryo kryo = getKryo();
 
     try (Output output = new Output(outputStream)) {
       kryo.writeClassAndObject(output, object);
     }
+  }
+
+  public static <T> T deserialize(byte[] bytes) {
+    return deserialize(new ByteArrayInputStream(bytes));
   }
 
   public static <T> T deserialize(Path filePath) throws IOException {
