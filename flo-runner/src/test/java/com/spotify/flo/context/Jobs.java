@@ -23,6 +23,7 @@ package com.spotify.flo.context;
 import com.spotify.flo.EvalContext;
 import com.spotify.flo.TaskBuilder.F0;
 import com.spotify.flo.TaskBuilder.F1;
+import com.spotify.flo.TaskId;
 import com.spotify.flo.TaskOperator;
 import com.spotify.flo.TaskOperator.Listener;
 import com.spotify.flo.TaskOperator.Operation;
@@ -41,12 +42,14 @@ class Jobs {
 
   static class JobSpec<T> implements Serializable {
 
+    private final TaskId taskId;
     private F0<Map<String, ?>> options;
     private SerializableConsumer<JobContext> pipelineConfigurator;
     private SerializableConsumer<JobResult> resultValidator;
     private F1<JobResult, T> successHandler;
 
-    JobSpec() {
+    JobSpec(TaskId taskId) {
+      this.taskId = taskId;
     }
 
     public JobSpec<T> options(F0<Map<String, ?>> options) {
@@ -74,7 +77,7 @@ class Jobs {
 
     @Override
     public JobSpec<T> provide(EvalContext evalContext) {
-      return new JobSpec<>();
+      return new JobSpec<>(evalContext.currentTask().get().id());
     }
 
     static <T> JobOperator<T> create() {
@@ -86,6 +89,7 @@ class Jobs {
       final JobContext jobContext = new JobContext(spec.options.get());
       spec.pipelineConfigurator.accept(jobContext);
       final Job job = jobContext.run();
+      listener.meta(spec.taskId, "job-id", job.id);
       log.info("started job: {}", job.id);
       return new JobOperation<>(spec, job);
     }

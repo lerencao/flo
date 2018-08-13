@@ -33,6 +33,9 @@ import java.util.Optional;
 public interface TaskOperator<ContextT, SpecT, ResultT>
     extends TaskContext<ContextT> {
 
+  /**
+   * Start an operation and wait for completion.
+   */
   @SuppressWarnings("unchecked")
   default ResultT perform(SpecT spec, Listener listener) {
     final Operation<ResultT, ?> operation = start(spec, listener);
@@ -60,12 +63,21 @@ public interface TaskOperator<ContextT, SpecT, ResultT>
     }
   }
 
-  Operation<ResultT, ?> start(SpecT spec, Listener listener);
+  /**
+   * Start an asynchronous operation.
+   * @return An {@link Operation} that can be used to check for completion.
+   */
+  default Operation<ResultT, ?> start(SpecT spec, Listener listener) {
+    throw new UnsupportedOperationException();
+  }
 
+  /**
+   * A callback for reporting task operation information.
+   */
   interface Listener extends Serializable {
 
     /**
-     * Called to report some piece of task metadata.
+     * Called to report some piece of task operation metadata.
      *
      * @param task The task that is being evaluated
      * @param key The metadata key.
@@ -73,8 +85,7 @@ public interface TaskOperator<ContextT, SpecT, ResultT>
      */
     void meta(TaskId task, String key, String value);
 
-    Listener NOP = (Listener) (task, key, value) -> {
-    };
+    Listener NOP = (Listener) (task, key, value) -> { };
 
     default Listener composeWith(Listener listener) {
       return (task, key, value) -> {
@@ -84,28 +95,67 @@ public interface TaskOperator<ContextT, SpecT, ResultT>
     }
   }
 
+  /**
+   * An asynchronous operation.
+   */
   interface Operation<ResultT, StateT> extends Serializable {
 
+    /**
+     * Attempt to make forward progress. Returns a {@link Result} indicating whether the operation is done and whether
+     * it was successful or failed.
+     */
     Result<ResultT, StateT> perform(Optional<StateT> state, Listener listener);
 
+    /**
+     * The result of an operation.
+     */
     interface Result<ResultT, StateT> extends Serializable {
 
+      /**
+       * Returns true if this operation is done.
+       */
       boolean isDone();
 
-      ResultT output();
-
-      Optional<StateT> state();
-
-      Duration pollInterval();
-
+      /**
+       * Returns true if this operation successfully completed.
+       * @throws IllegalStateException if the operation is not yet done.
+       */
       boolean isSuccess();
 
+      /**
+       * Returns the result if this operation successfully completed.
+       * @throws IllegalStateException if the operation is not yet done or has failed.
+       */
+      ResultT output();
+
+      /**
+       * Returns the failure cause if the operation failed.
+       * @throws IllegalStateException if the operation is not yet done or was successful.
+       */
       Throwable cause();
 
+      /**
+       * Returns some state that should be passed back on the next call to {@link #perform(Optional, Listener)}.
+       * @throws IllegalStateException if the operation is done.
+       */
+      Optional<StateT> state();
+
+      /**
+       * If the operation was not done, returns when {@link #perform(Optional, Listener)} should be called again.
+       * @throws IllegalStateException if the operation is done.
+       */
+      Duration pollInterval();
+
+      /**
+       * Create a {@link Result} indicating that the operation is still ongoing.
+       */
       static <ResultT> Result<ResultT, Void> ofContinuation(Duration pollInterval) {
         return ofContinuation(pollInterval, null);
       }
 
+      /**
+       * Create a {@link Result} indicating that the operation is still ongoing.
+       */
       static <ResultT, StateT> Result<ResultT, StateT> ofContinuation(Duration pollInterval, StateT state) {
         return new Result<ResultT, StateT>() {
           @Override
@@ -140,6 +190,9 @@ public interface TaskOperator<ContextT, SpecT, ResultT>
         };
       }
 
+      /**
+       * Create a {@link Result} indicating that the operation successfully completed.
+       */
       static <ResultT, StateT> Result<ResultT, StateT> ofSuccess(ResultT output) {
         return new Result<ResultT, StateT>() {
           @Override
@@ -174,6 +227,9 @@ public interface TaskOperator<ContextT, SpecT, ResultT>
         };
       }
 
+      /**
+       * Create a {@link Result} indicating that the operation failed.
+       */
       static <ResultT, StateT> Result<ResultT, StateT> ofFailure(Throwable cause) {
         return new Result<ResultT, StateT>() {
           @Override
